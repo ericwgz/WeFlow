@@ -1,0 +1,146 @@
+.title-bar {
+  height: 41px;
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-left: 16px;
+  padding-right: 16px;
+  border-bottom: 1px solid var(--border-color);
+  -webkit-app-region: drag;
+  flex-shrink: 0;
+  gap: 8px;
+  position: relative;
+  z-index: 2101;
+}
+
+// 繁花如梦：标题栏毛玻璃
+[data-theme="blossom-dream"] .title-bar {
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.title-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.title-logo {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+
+.titles {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.title-sidebar-toggle {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+  -webkit-app-region: no-drag;
+
+  &:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+}
+
+.title-window-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  -webkit-app-region: no-drag;
+}
+
+.title-window-control-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+
+  &:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  &.is-close:hover {
+    background: #e5484d;
+    color: #fff;
+  }
+}
+
+.image-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: auto;
+  padding-left: 16px;
+  -webkit-app-region: no-drag;
+
+  button {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+
+    &:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+    }
+
+    &:disabled {
+      cursor: default;
+      opacity: 1;
+    }
+
+    &.live-play-btn.active {
+      background: rgba(var(--primary-rgb, 76, 132, 255), 0.16);
+      color: var(--primary, #4c84ff);
+    }
+  }
+
+  .scale-text {
+    min-width: 50px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-color);
+    margin: 0 4px;
+  }
+}
