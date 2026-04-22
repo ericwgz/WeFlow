@@ -113,6 +113,7 @@ interface ExportOptions {
   txtColumns: string[]
   displayNamePreference: DisplayNamePreference
   exportConcurrency: number
+  diagnosticTraceId?: string
 }
 
 interface SessionRow extends AppChatSession {
@@ -168,6 +169,10 @@ interface TaskNianbanUploadState {
   status: 'idle' | 'uploading' | 'success' | 'error'
   dyadId: number
   importedCount?: number
+  textImportedCount?: number
+  imageImportedCount?: number
+  voiceImportedCount?: number
+  failedCount?: number
   skippedCount?: number
   error?: string
 }
@@ -2008,9 +2013,9 @@ const TaskCenterModal = memo(function TaskCenterModal({
                       )}
                       {task.nianbanUpload && task.nianbanUpload.status !== 'idle' && (
                         <div className={`task-upload-summary ${task.nianbanUpload.status}`}>
-                          {task.nianbanUpload.status === 'uploading' && `本地导出完成，正在上传到念伴 Dyad ${task.nianbanUpload.dyadId}...`}
-                          {task.nianbanUpload.status === 'success' && `已上传到念伴，导入 ${task.nianbanUpload.importedCount || 0} 条，跳过 ${task.nianbanUpload.skippedCount || 0} 条`}
-                          {task.nianbanUpload.status === 'error' && `导出完成，但上传未完成：${task.nianbanUpload.error || '上传失败'}`}
+                          {task.nianbanUpload.status === 'uploading' && `本地导出完成，正在读取导出结果并上传到念伴 Dyad ${task.nianbanUpload.dyadId}...`}
+                          {task.nianbanUpload.status === 'success' && `已上传到念伴：文本 ${task.nianbanUpload.textImportedCount || 0} 条，图片 ${task.nianbanUpload.imageImportedCount || 0} 条，语音 ${task.nianbanUpload.voiceImportedCount || 0} 条，跳过 ${task.nianbanUpload.skippedCount || 0} 条`}
+                          {task.nianbanUpload.status === 'error' && `导出完成，但上传未完全成功：文本 ${task.nianbanUpload.textImportedCount || 0} 条，图片 ${task.nianbanUpload.imageImportedCount || 0} 条，语音 ${task.nianbanUpload.voiceImportedCount || 0} 条，跳过 ${task.nianbanUpload.skippedCount || 0} 条，失败 ${task.nianbanUpload.failedCount || 0} 条。${task.nianbanUpload.error || '上传失败'}`}
                         </div>
                       )}
                       {canShowPerfDetail && isPerfExpanded && stageTotals && (
@@ -5761,7 +5766,10 @@ function ExportPage() {
         const result = await window.electronAPI.export.exportSessions(
           next.payload.sessionIds,
           next.payload.outputDir,
-          next.payload.options
+          {
+            ...next.payload.options,
+            diagnosticTraceId: next.id
+          }
         )
 
         if (!result.success) {
@@ -5825,6 +5833,10 @@ function ExportPage() {
                   status: targetJsonPath ? 'uploading' : 'error',
                   dyadId: nianbanUploadConfig.dyadId,
                   importedCount: undefined,
+                  textImportedCount: undefined,
+                  imageImportedCount: undefined,
+                  voiceImportedCount: undefined,
+                  failedCount: undefined,
                   skippedCount: undefined,
                   error: targetJsonPath ? undefined : '导出完成，但未找到可上传的 JSON 文件'
                 }
@@ -5836,6 +5848,7 @@ function ExportPage() {
               try {
                 const uploadResult: NianbanExportUploadResult = await window.electronAPI.export.uploadExportedChatToNianban({
                   sessionId: targetSessionId,
+                  outputDir: next.payload.outputDir,
                   jsonPath: targetJsonPath,
                   baseUrl: nianbanUploadConfig.baseUrl,
                   deviceId: nianbanUploadConfig.deviceId,
@@ -5851,6 +5864,10 @@ function ExportPage() {
                           ...task.nianbanUpload,
                           status: 'success',
                           importedCount: uploadResult.importedCount,
+                          textImportedCount: uploadResult.textImportedCount,
+                          imageImportedCount: uploadResult.imageImportedCount,
+                          voiceImportedCount: uploadResult.voiceImportedCount,
+                          failedCount: uploadResult.failedCount,
                           skippedCount: uploadResult.skippedCount,
                           error: undefined
                         }
@@ -5858,6 +5875,10 @@ function ExportPage() {
                           ...task.nianbanUpload,
                           status: 'error',
                           importedCount: uploadResult.importedCount,
+                          textImportedCount: uploadResult.textImportedCount,
+                          imageImportedCount: uploadResult.imageImportedCount,
+                          voiceImportedCount: uploadResult.voiceImportedCount,
+                          failedCount: uploadResult.failedCount,
                           skippedCount: uploadResult.skippedCount,
                           error: uploadResult.error || '上传失败'
                         }
@@ -7826,8 +7847,7 @@ function ExportPage() {
     : undefined
   const shouldShowNianbanUploadSection = (
     exportDialog.intent === 'manual' &&
-    exportDialog.scope === 'single' &&
-    activeSingleSession?.kind === 'private'
+    exportDialog.scope === 'single'
   )
   const resolvedNianbanDyadId = parsePositiveInteger(nianbanDyadId)
   const shouldUploadToNianban = shouldShowNianbanUploadSection && uploadToNianban
@@ -7835,11 +7855,12 @@ function ExportPage() {
     if (!shouldUploadToNianban) return [] as string[]
     const errors: string[] = []
     if (options.format !== 'json') errors.push('导出至念伴仅支持 JSON 格式')
+    if (activeSingleSession?.kind && activeSingleSession.kind !== 'private') errors.push('当前仅支持单联系人私聊上传')
     if (!nianbanBaseUrl.trim()) errors.push('请填写念伴后端地址')
     if (!nianbanDeviceId.trim()) errors.push('请填写 X-Device-Id')
     if (resolvedNianbanDyadId == null) errors.push('目标 Dyad ID 必须是正整数')
     return errors
-  }, [shouldUploadToNianban, options.format, nianbanBaseUrl, nianbanDeviceId, resolvedNianbanDyadId])
+  }, [shouldUploadToNianban, options.format, activeSingleSession?.kind, nianbanBaseUrl, nianbanDeviceId, resolvedNianbanDyadId])
   const canCreateTask = (
     exportDialog.scope === 'sns'
       ? Boolean(exportFolder)
@@ -10265,7 +10286,7 @@ function ExportPage() {
                   <div className="dialog-switch-row">
                     <div className="dialog-switch-copy">
                       <h4>导出后上传至念伴</h4>
-                      <div className="format-note">仅依赖本次导出的 JSON 文件。WeFlow 先完成导出，再读取导出结果并上传到念伴后端。</div>
+                      <div className="format-note">仅依赖本次导出的 JSON、图片和语音文件。WeFlow 先完成本地导出，再读取导出结果并上传到念伴后端。</div>
                     </div>
                     <button
                       type="button"

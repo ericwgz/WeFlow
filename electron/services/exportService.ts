@@ -14,6 +14,7 @@ import { videoService } from './videoService'
 import { voiceTranscribeService } from './voiceTranscribeService'
 import { exportRecordService } from './exportRecordService'
 import { EXPORT_HTML_STYLES } from './exportHtmlStyles'
+import { exportCardDiagnosticsService } from './exportCardDiagnosticsService'
 import { LRUCache } from '../utils/LRUCache.js'
 
 // ChatLab 格式类型定义
@@ -108,6 +109,7 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
+  diagnosticTraceId?: string
 }
 
 const TXT_COLUMN_DEFINITIONS: Array<{ id: string; label: string }> = [
@@ -282,6 +284,7 @@ class ExportService {
   private emoticonDbPathCache: string | null = null
   private emoticonDbPathCacheToken = ''
   private readonly emojiCaptionLookupConcurrency = 8
+  private activeExportDiagTraceId: string | null = null
 
   constructor() {
     this.configService = new ConfigService()
@@ -298,6 +301,82 @@ class ExportService {
 
   setRuntimeConfig(config: { dbPath?: string; decryptKey?: string; myWxid?: string } | null): void {
     this.runtimeConfig = config
+  }
+
+  private normalizeExportDiagTraceId(traceId?: string): string {
+    return String(traceId || '').trim()
+  }
+
+  private logExportDiag(input: {
+    level?: 'debug' | 'info' | 'warn' | 'error'
+    message: string
+    stepId?: string
+    stepName?: string
+    status?: 'running' | 'done' | 'failed' | 'timeout'
+    durationMs?: number
+    data?: Record<string, unknown>
+  }): void {
+    const traceId = this.normalizeExportDiagTraceId(this.activeExportDiagTraceId || undefined)
+    if (!traceId) return
+    exportCardDiagnosticsService.log({
+      traceId,
+      source: process.env.WEFLOW_WORKER === '1' ? 'worker' : 'main',
+      level: input.level || 'info',
+      message: input.message,
+      stepId: input.stepId,
+      stepName: input.stepName,
+      status: input.status,
+      durationMs: input.durationMs,
+      data: input.data
+    })
+  }
+
+  private logCollectSummary(
+    sessionId: string,
+    collectMode: MessageCollectMode,
+    rows: any[],
+    targetMediaTypes?: Set<number>
+  ): void {
+    const traceId = this.normalizeExportDiagTraceId(this.activeExportDiagTraceId || undefined)
+    if (!traceId) return
+
+    let imageCount = 0
+    let imageWithMd5 = 0
+    let imageWithDatName = 0
+    let imageMissingMetadata = 0
+    let voiceCount = 0
+    let voiceWithServerIdRaw = 0
+
+    for (const row of rows) {
+      if (row?.localType === 3) {
+        imageCount += 1
+        if (row?.imageMd5) imageWithMd5 += 1
+        if (row?.imageDatName) imageWithDatName += 1
+        if (!row?.imageMd5 && !row?.imageDatName) imageMissingMetadata += 1
+      } else if (row?.localType === 34) {
+        voiceCount += 1
+        if (row?.serverIdRaw) voiceWithServerIdRaw += 1
+      }
+    }
+
+    this.logExportDiag({
+      level: 'debug',
+      stepId: 'collect-messages',
+      stepName: '收集消息',
+      message: `消息采集完成: ${sessionId}`,
+      data: {
+        sessionId,
+        collectMode,
+        rowCount: rows.length,
+        targetMediaTypes: targetMediaTypes ? Array.from(targetMediaTypes) : undefined,
+        imageCount,
+        imageWithMd5,
+        imageWithDatName,
+        imageMissingMetadata,
+        voiceCount,
+        voiceWithServerIdRaw
+      }
+    })
   }
 
   private normalizeSessionIds(sessionIds: string[]): string[] {
@@ -3663,6 +3742,17 @@ class ExportService {
       const imageDatName = msg.imageDatName
 
       if (!imageMd5 && !imageDatName) {
+        this.logExportDiag({
+          level: 'warn',
+          stepId: 'export-image',
+          stepName: '导出图片',
+          message: '图片缺少 imageMd5/imageDatName，无法导出原始文件',
+          data: {
+            sessionId,
+            localId: msg?.localId,
+            createTime: msg?.createTime
+          }
+        })
         return null
       }
 
@@ -3689,6 +3779,21 @@ class ExportService {
       })
 
       if (!result.success || !result.localPath) {
+        this.logExportDiag({
+          level: result.failureKind === 'decrypt_failed' ? 'error' : 'warn',
+          stepId: 'export-image',
+          stepName: '导出图片',
+          message: '图片主路径解析失败',
+          data: {
+            sessionId,
+            localId: msg?.localId,
+            createTime: msg?.createTime,
+            imageMd5,
+            imageDatName,
+            failureKind: result.failureKind,
+            error: result.error || ''
+          }
+        })
         if (result.failureKind === 'decrypt_failed') {
           console.log(`[Export] 图片解密失败 (localId=${msg.localId}): imageMd5=${imageMd5}, imageDatName=${imageDatName}, error=${result.error || '未知'}`)
         } else {
@@ -3706,10 +3811,38 @@ class ExportService {
           suppressEvents: true
         })
         if (thumbResult.success && thumbResult.localPath) {
+          this.logExportDiag({
+            level: 'info',
+            stepId: 'export-image',
+            stepName: '导出图片',
+            message: '图片高清缺失，已回退到缩略图',
+            data: {
+              sessionId,
+              localId: msg?.localId,
+              imageMd5,
+              imageDatName,
+              thumbPath: thumbResult.localPath
+            }
+          })
           console.log(`[Export] 使用缩略图替代 (localId=${msg.localId}): ${thumbResult.localPath}`)
           result.localPath = thumbResult.localPath
         } else {
           console.log(`[Export] 缩略图也获取失败，所有方式均失败 → 将显示 [图片] 占位符`)
+          this.logExportDiag({
+            level: 'error',
+            stepId: 'export-image',
+            stepName: '导出图片',
+            message: '图片高清与缩略图均未定位到',
+            data: {
+              sessionId,
+              localId: msg?.localId,
+              createTime: msg?.createTime,
+              imageMd5,
+              imageDatName,
+              primaryFailure: result.error || '',
+              thumbFailure: thumbResult.error || ''
+            }
+          })
           if (missingRunCacheKey) {
             this.mediaRunMissingImageKeys.add(missingRunCacheKey)
           }
@@ -3752,6 +3885,20 @@ class ExportService {
       const destPath = path.join(imagesDir, fileName)
       const copied = await this.copyMediaWithCacheAndDedup('image', sourcePath, destPath)
       if (!copied.success) {
+        this.logExportDiag({
+          level: 'error',
+          stepId: 'export-image',
+          stepName: '导出图片',
+          message: '图片复制到导出目录失败',
+          data: {
+            sessionId,
+            localId: msg?.localId,
+            sourcePath,
+            destPath,
+            code: copied.code || '',
+            error: copied.error || ''
+          }
+        })
         if (copied.code === 'ENOENT') {
           console.log(`[Export] 源图片文件不存在 (localId=${msg.localId}): ${sourcePath} → 将显示 [图片] 占位符`)
         } else {
@@ -3765,6 +3912,17 @@ class ExportService {
         kind: 'image'
       }
     } catch (e) {
+      this.logExportDiag({
+        level: 'error',
+        stepId: 'export-image',
+        stepName: '导出图片',
+        message: '导出图片时抛出异常',
+        data: {
+          sessionId,
+          localId: msg?.localId,
+          error: e instanceof Error ? e.message : String(e)
+        }
+      })
       console.error(`[Export] 导出图片异常 (localId=${msg.localId}):`, e, `→ 将显示 [图片] 占位符`)
       return null
     }
@@ -3903,6 +4061,21 @@ class ExportService {
         msg?.senderUsername || undefined
       )
       if (!voiceResult.success || !voiceResult.data) {
+        this.logExportDiag({
+          level: 'warn',
+          stepId: 'export-voice',
+          stepName: '导出语音',
+          message: '语音数据未找到或解码失败',
+          data: {
+            sessionId,
+            localId: msg?.localId,
+            createTime: msg?.createTime,
+            serverId: msg?.serverId,
+            serverIdRaw: msg?.serverIdRaw,
+            senderUsername: msg?.senderUsername,
+            error: voiceResult.error || ''
+          }
+        })
         return null
       }
 
@@ -3914,11 +4087,36 @@ class ExportService {
         bytesWritten: wavBuffer.length
       })
 
+      this.logExportDiag({
+        level: 'debug',
+        stepId: 'export-voice',
+        stepName: '导出语音',
+        message: '语音已写入导出目录',
+        data: {
+          sessionId,
+          localId: msg?.localId,
+          createTime: msg?.createTime,
+          destPath,
+          bytes: wavBuffer.length
+        }
+      })
+
       return {
         relativePath: path.posix.join(mediaRelativePrefix, 'voices', fileName),
         kind: 'voice'
       }
     } catch (e) {
+      this.logExportDiag({
+        level: 'error',
+        stepId: 'export-voice',
+        stepName: '导出语音',
+        message: '导出语音时抛出异常',
+        data: {
+          sessionId,
+          localId: msg?.localId,
+          error: e instanceof Error ? e.message : String(e)
+        }
+      })
       return null
     }
   }
@@ -4737,6 +4935,7 @@ class ExportService {
       }
     }
 
+    this.logCollectSummary(sessionId, collectMode, rows, targetMediaTypes)
     return { rows, memberSet, firstTime, lastTime }
   }
 
@@ -9032,6 +9231,13 @@ class ExportService {
     const sessionOutputPaths: Record<string, string> = {}
     const progressEmitter = this.createProgressEmitter(onProgress)
     let attachMediaTelemetry = false
+    const diagnosticTraceId = this.normalizeExportDiagTraceId(options.diagnosticTraceId)
+    this.activeExportDiagTraceId = diagnosticTraceId || null
+    if (diagnosticTraceId) {
+      process.env.WEFLOW_EXPORT_DIAG_TRACE_ID = diagnosticTraceId
+    } else {
+      delete process.env.WEFLOW_EXPORT_DIAG_TRACE_ID
+    }
     const emitProgress = (progress: ExportProgress, options?: { force?: boolean }) => {
       const payload = attachMediaTelemetry
         ? { ...progress, ...this.getMediaTelemetrySnapshot() }
@@ -9040,8 +9246,39 @@ class ExportService {
     }
 
     try {
+      this.logExportDiag({
+        level: 'info',
+        stepId: 'export-sessions',
+        stepName: '批量导出',
+        status: 'running',
+        message: '开始导出任务',
+        data: {
+          sessionCount: sessionIds.length,
+          format: options.format,
+          exportMedia: options.exportMedia === true,
+          exportImages: options.exportImages === true,
+          exportVoices: options.exportVoices === true,
+          exportVideos: options.exportVideos === true,
+          exportEmojis: options.exportEmojis === true,
+          exportFiles: options.exportFiles === true,
+          isWorker: process.env.WEFLOW_WORKER === '1',
+          isPackaged: typeof process !== 'undefined' ? process.env.NODE_ENV !== 'development' : undefined,
+          resourcesPath: process.env.WCDB_RESOURCES_PATH || '',
+          userDataPath: process.env.WEFLOW_USER_DATA_PATH || ''
+        }
+      })
       const conn = await this.ensureConnected()
       if (!conn.success) {
+        this.logExportDiag({
+          level: 'error',
+          stepId: 'export-sessions',
+          stepName: '批量导出',
+          status: 'failed',
+          message: '导出前数据库连接失败',
+          data: {
+            error: conn.error || ''
+          }
+        })
         return { success: false, successCount: 0, failCount: sessionIds.length, error: conn.error }
       }
 
@@ -9248,6 +9485,16 @@ class ExportService {
         try {
           this.throwIfStopRequested(control)
           const sessionInfo = await this.getContactInfo(sessionId)
+          this.logExportDiag({
+            level: 'info',
+            stepId: 'export-session',
+            stepName: '单会话导出',
+            message: `开始导出会话: ${sessionInfo.displayName}`,
+            data: {
+              sessionId,
+              displayName: sessionInfo.displayName
+            }
+          })
           const messageCountHint = sessionMessageCountHints.get(sessionId)
           const latestTimestampHint = sessionLatestTimestampHints.get(sessionId)
 
@@ -9398,6 +9645,18 @@ class ExportService {
             successCount++
             successSessionIds.push(sessionId)
             sessionOutputPaths[sessionId] = outputPath
+            this.logExportDiag({
+              level: 'info',
+              stepId: 'export-session',
+              stepName: '单会话导出',
+              status: 'done',
+              message: `会话导出成功: ${sessionInfo.displayName}`,
+              data: {
+                sessionId,
+                outputPath,
+                format: effectiveOptions.format
+              }
+            })
             if (typeof messageCountHint === 'number' && messageCountHint >= 0) {
               exportRecordService.saveRecord(sessionId, effectiveOptions.format, messageCountHint, {
                 sourceLatestMessageTimestamp: typeof latestTimestampHint === 'number' && latestTimestampHint > 0
@@ -9409,6 +9668,19 @@ class ExportService {
           } else {
             failCount++
             failedSessionIds.push(sessionId)
+            this.logExportDiag({
+              level: 'error',
+              stepId: 'export-session',
+              stepName: '单会话导出',
+              status: 'failed',
+              message: `会话导出失败: ${sessionInfo.displayName}`,
+              data: {
+                sessionId,
+                outputPath,
+                format: effectiveOptions.format,
+                error: result.error || ''
+              }
+            })
             console.error(`导出 ${sessionId} 失败:`, result.error)
           }
 
@@ -9514,11 +9786,36 @@ class ExportService {
       }, { force: true })
       progressEmitter.flush()
 
+      this.logExportDiag({
+        level: failCount > 0 ? 'warn' : 'info',
+        stepId: 'export-sessions',
+        stepName: '批量导出',
+        status: failCount > 0 ? 'failed' : 'done',
+        message: failCount > 0 ? '导出任务完成，但存在失败会话' : '导出任务完成',
+        data: {
+          successCount,
+          failCount,
+          successSessionIds,
+          failedSessionIds
+        }
+      })
       return { success: true, successCount, failCount, successSessionIds, failedSessionIds, sessionOutputPaths }
     } catch (e) {
       progressEmitter.flush()
+      this.logExportDiag({
+        level: 'error',
+        stepId: 'export-sessions',
+        stepName: '批量导出',
+        status: 'failed',
+        message: '导出任务异常终止',
+        data: {
+          error: e instanceof Error ? e.message : String(e)
+        }
+      })
       return { success: false, successCount, failCount, error: String(e) }
     } finally {
+      this.activeExportDiagTraceId = null
+      delete process.env.WEFLOW_EXPORT_DIAG_TRACE_ID
       this.clearMediaRuntimeState()
     }
   }

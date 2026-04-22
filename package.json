@@ -23,6 +23,7 @@
     "electron:build": "npm run build"
   },
   "dependencies": {
+    "cos-nodejs-sdk-v5": "^2.15.4",
     "echarts": "^6.0.0",
     "echarts-for-react": "^3.0.2",
     "electron-store": "^11.0.2",

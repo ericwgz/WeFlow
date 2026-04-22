@@ -2921,9 +2921,37 @@ function registerIpcHandlers() {
       queueProgress(progress)
     }
 
+    const diagnosticTraceId = String(options?.diagnosticTraceId || `export-${Date.now()}`)
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]/g, '_') || `export-${Date.now()}`
+    const effectiveOptions: ExportOptions = {
+      ...(options || { format: 'json' }),
+      diagnosticTraceId
+    }
+    const persistMainDiagnostics = async () => {
+      const logDir = join(app.getPath('userData'), 'logs', 'export-media-debug')
+      const traceFilePath = join(logDir, `${diagnosticTraceId}.jsonl`)
+      const latestFilePath = join(logDir, 'latest.jsonl')
+      const traceResult = await exportCardDiagnosticsService.exportCombinedLogs(traceFilePath, [])
+      const latestResult = await exportCardDiagnosticsService.exportCombinedLogs(latestFilePath, [])
+      return {
+        diagnosticTraceId,
+        diagnosticLogPath: traceResult.filePath || traceFilePath,
+        diagnosticSummaryPath: traceResult.summaryPath || traceFilePath.replace(/\.jsonl$/i, '.txt'),
+        latestDiagnosticLogPath: latestResult.filePath || latestFilePath,
+        latestDiagnosticSummaryPath: latestResult.summaryPath || latestFilePath.replace(/\.jsonl$/i, '.txt')
+      }
+    }
+
     const runMainFallback = async (reason: string) => {
       console.warn(`[fallback-export-main] ${reason}`)
-      return exportService.exportSessions(sessionIds, outputDir, options, onProgress)
+      exportCardDiagnosticsService.clear()
+      const result = await exportService.exportSessions(sessionIds, outputDir, effectiveOptions, onProgress)
+      const diagnostics = await persistMainDiagnostics()
+      return {
+        ...result,
+        ...diagnostics
+      }
     }
 
     const cfg = configService || new ConfigService()
@@ -2944,7 +2972,7 @@ function registerIpcHandlers() {
           workerData: {
             sessionIds,
             outputDir,
-            options,
+            options: effectiveOptions,
             dbPath,
             decryptKey,
             myWxid,
@@ -3000,6 +3028,7 @@ function registerIpcHandlers() {
     }
 
     try {
+      exportCardDiagnosticsService.clear()
       return await runWorker()
     } catch (error) {
       return runMainFallback(error instanceof Error ? error.message : String(error))
@@ -3919,6 +3948,5 @@ app.on('window-all-closed', () => {
     app.quit()
   }
 })
-
 
 

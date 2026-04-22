@@ -8,6 +8,7 @@ import crypto from 'crypto'
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { decryptDatViaNative, nativeAddonLocation } from './nativeImageDecrypt'
+import { exportCardDiagnosticsService } from './exportCardDiagnosticsService'
 
 // 获取 ffmpeg-static 的路径
 function getStaticFfmpegPath(): string | null {
@@ -132,6 +133,44 @@ export class ImageDecryptService {
       appendFileSync(join(logDir, 'wcdb.log'), line, { encoding: 'utf8' })
     } catch (err) {
       console.error('写入日志失败:', err)
+    }
+  }
+
+  private getExportDiagTraceId(): string {
+    return String(process.env.WEFLOW_EXPORT_DIAG_TRACE_ID || '').trim()
+  }
+
+  private logExportDiag(
+    message: string,
+    data?: Record<string, unknown>,
+    level: 'debug' | 'info' | 'warn' | 'error' = 'debug'
+  ): void {
+    const traceId = this.getExportDiagTraceId()
+    if (!traceId) return
+    exportCardDiagnosticsService.log({
+      traceId,
+      source: process.env.WEFLOW_WORKER === '1' ? 'worker' : 'main',
+      level,
+      message,
+      stepId: 'image-resolve-path',
+      stepName: '图片路径解析',
+      data
+    })
+  }
+
+  private summarizeDatCandidates(paths: string[], baseMd5: string): Record<string, unknown> {
+    const uniquePaths = Array.from(new Set((paths || []).map((item) => String(item || '').trim()).filter(Boolean)))
+    const hdCount = uniquePaths.filter((item) => this.isHdDatPath(item)).length
+    const baseCount = uniquePaths.filter((item) => this.isBaseDatPath(item, baseMd5)).length
+    const thumbCount = uniquePaths.filter((item) => this.isTVariantDat(item)).length
+    const imgScopedCount = uniquePaths.filter((item) => this.isImgScopedDatPath(item)).length
+    return {
+      candidateCount: uniquePaths.length,
+      hdCount,
+      baseCount,
+      thumbCount,
+      imgScopedCount,
+      samplePaths: uniquePaths.slice(0, 6)
     }
   }
 
@@ -619,8 +658,27 @@ export class ImageDecryptService {
     })
 
     const lookupBases = this.collectLookupBasesForScan(imageMd5, imageDatName, allowDatNameScanFallback)
+    this.logExportDiag('开始解析图片 DAT 路径', {
+      imageMd5,
+      imageDatName,
+      sessionId,
+      createTime,
+      allowThumbnail,
+      skipResolvedCache,
+      hardlinkOnly,
+      allowDatNameScanFallback,
+      lookupBases,
+      monthKey: this.resolveYearMonthFromCreateTime(createTime),
+      accountDir
+    })
     if (lookupBases.length === 0) {
       this.logInfo('[ImageDecrypt] resolveDatPath miss (no lookup base)', { imageMd5, imageDatName })
+      this.logExportDiag('图片 DAT 路径解析失败: 没有可用的 lookup base', {
+        imageMd5,
+        imageDatName,
+        sessionId,
+        createTime
+      }, 'warn')
       return null
     }
 
@@ -635,6 +693,16 @@ export class ImageDecryptService {
         const cached = this.resolvedCache.get(scopedKey)
         if (!cached || !existsSync(cached)) continue
         if (!allowThumbnail && !this.isHdDatPath(cached)) continue
+        this.logExportDiag('图片 DAT 路径命中 resolvedCache', {
+          imageMd5,
+          imageDatName,
+          sessionId,
+          createTime,
+          cacheKey,
+          scopedKey,
+          cachedPath: cached,
+          isHd: this.isHdDatPath(cached)
+        })
         return cached
       }
     }
@@ -653,6 +721,15 @@ export class ImageDecryptService {
         selectedPath,
         allowThumbnail
       })
+      this.logExportDiag('图片 DAT 路径解析成功', {
+        imageMd5,
+        imageDatName,
+        sessionId,
+        createTime,
+        baseMd5,
+        allowThumbnail,
+        selectedPath
+      }, 'info')
       return selectedPath
     }
 
@@ -662,6 +739,19 @@ export class ImageDecryptService {
       lookupBases,
       allowThumbnail
     })
+    this.logExportDiag('图片 DAT 路径解析失败: dat scan miss', {
+      imageMd5,
+      imageDatName,
+      sessionId,
+      createTime,
+      lookupBases,
+      allowThumbnail,
+      sessionDir: this.resolveSessionDirForStorage(String(sessionId || '').trim()),
+      monthKey: this.resolveYearMonthFromCreateTime(createTime),
+      expectedImgDir: sessionId
+        ? join(accountDir, 'msg', 'attach', this.resolveSessionDirForStorage(String(sessionId || '').trim()), this.resolveYearMonthFromCreateTime(createTime), 'Img')
+        : ''
+    }, 'warn')
     return null
   }
 
@@ -941,16 +1031,48 @@ export class ImageDecryptService {
     allowThumbnail = true
   ): string | null {
     const candidates = this.collectAllDatCandidatesForBase(accountDir, baseMd5, sessionId, createTime)
-    if (candidates.length === 0) return null
+    if (candidates.length === 0) {
+      this.logExportDiag('候选 DAT 扫描为空', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        monthKey: this.resolveYearMonthFromCreateTime(createTime),
+        expectedImgDir: sessionId
+          ? join(accountDir, 'msg', 'attach', this.resolveSessionDirForStorage(String(sessionId || '').trim()), this.resolveYearMonthFromCreateTime(createTime), 'Img')
+          : ''
+      })
+      return null
+    }
 
     const imgCandidates = candidates.filter((item) => this.isImgScopedDatPath(item))
     const imgHdCandidates = imgCandidates.filter((item) => this.isHdDatPath(item))
     const hdInImg = this.pickLargestDatPath(imgHdCandidates)
-    if (hdInImg) return hdInImg
+    if (hdInImg) {
+      this.logExportDiag('候选 DAT 选择结果: img scoped hd', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        selectedPath: hdInImg,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      }, 'info')
+      return hdInImg
+    }
 
     if (!allowThumbnail) {
       // 高清优先仅认 img/image/msgimg 路径中的 H 变体；
       // 若该范围没有，则交由 allowThumbnail=true 的回退分支按 base.dat/_t 继续挑选。
+      this.logExportDiag('候选 DAT 选择结果: 高清模式下未命中 H 变体', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      })
       return null
     }
 
@@ -958,23 +1080,75 @@ export class ImageDecryptService {
     const baseDatInImg = this.pickLargestDatPath(
       imgCandidates.filter((item) => this.isBaseDatPath(item, baseMd5))
     )
-    if (baseDatInImg) return baseDatInImg
+    if (baseDatInImg) {
+      this.logExportDiag('候选 DAT 选择结果: img scoped base.dat', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        selectedPath: baseDatInImg,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      }, 'info')
+      return baseDatInImg
+    }
 
     const baseDatAny = this.pickLargestDatPath(
       candidates.filter((item) => this.isBaseDatPath(item, baseMd5))
     )
-    if (baseDatAny) return baseDatAny
+    if (baseDatAny) {
+      this.logExportDiag('候选 DAT 选择结果: any base.dat', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        selectedPath: baseDatAny,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      }, 'info')
+      return baseDatAny
+    }
 
     const thumbDatInImg = this.pickLargestDatPath(
       imgCandidates.filter((item) => this.isTVariantDat(item))
     )
-    if (thumbDatInImg) return thumbDatInImg
+    if (thumbDatInImg) {
+      this.logExportDiag('候选 DAT 选择结果: img scoped thumbnail', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        selectedPath: thumbDatInImg,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      }, 'info')
+      return thumbDatInImg
+    }
 
     const thumbDatAny = this.pickLargestDatPath(
       candidates.filter((item) => this.isTVariantDat(item))
     )
-    if (thumbDatAny) return thumbDatAny
+    if (thumbDatAny) {
+      this.logExportDiag('候选 DAT 选择结果: any thumbnail', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        allowThumbnail,
+        selectedPath: thumbDatAny,
+        ...this.summarizeDatCandidates(candidates, baseMd5)
+      }, 'info')
+      return thumbDatAny
+    }
 
+    this.logExportDiag('候选 DAT 存在，但没有命中可接受的高清/原图/缩略图规则', {
+      accountDir,
+      baseMd5,
+      sessionId,
+      createTime,
+      allowThumbnail,
+      ...this.summarizeDatCandidates(candidates, baseMd5)
+    }, 'warn')
     return null
   }
 
@@ -1051,10 +1225,30 @@ export class ImageDecryptService {
   ): string[] {
     const normalizedSessionId = String(sessionId || '').trim()
     const monthKey = this.resolveYearMonthFromCreateTime(createTime)
-    if (!normalizedSessionId || !monthKey) return []
+    if (!normalizedSessionId || !monthKey) {
+      this.logExportDiag('会话月目录扫描跳过: 缺少 sessionId 或 monthKey', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        normalizedSessionId,
+        monthKey
+      })
+      return []
+    }
 
     const sessionDir = this.resolveSessionDirForStorage(normalizedSessionId)
-    if (!sessionDir) return []
+    if (!sessionDir) {
+      this.logExportDiag('会话月目录扫描跳过: 无法解析 sessionDir', {
+        accountDir,
+        baseMd5,
+        sessionId,
+        createTime,
+        normalizedSessionId,
+        monthKey
+      }, 'warn')
+      return []
+    }
     const candidates = new Set<string>()
     const budget = { remaining: 240 }
     const targetDirs: Array<{ dir: string; depth: number }> = [
@@ -1062,12 +1256,39 @@ export class ImageDecryptService {
       { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 }
     ]
 
+    this.logExportDiag('开始扫描会话月目录下的 DAT 候选', {
+      accountDir,
+      baseMd5,
+      sessionId,
+      createTime,
+      monthKey,
+      sessionDir,
+      targetDirs: targetDirs.map((item) => ({
+        dir: item.dir,
+        depth: item.depth,
+        exists: existsSync(item.dir),
+        isDirectory: existsSync(item.dir) ? this.isDirectory(item.dir) : false
+      }))
+    })
+
     for (const target of targetDirs) {
       if (budget.remaining <= 0) break
       this.scanDatCandidatesUnderRoot(target.dir, baseMd5, target.depth, candidates, budget)
     }
 
-    return Array.from(candidates)
+    const result = Array.from(candidates)
+    this.logExportDiag('会话月目录扫描结束', {
+      accountDir,
+      baseMd5,
+      sessionId,
+      createTime,
+      monthKey,
+      sessionDir,
+      candidateCount: result.length,
+      samplePaths: result.slice(0, 6),
+      budgetRemaining: budget.remaining
+    })
+    return result
   }
 
   private resolveSessionDirForStorage(sessionId: string): string {

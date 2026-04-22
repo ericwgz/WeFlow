@@ -986,6 +986,11 @@ export interface ElectronAPI {
       successSessionIds?: string[]
       failedSessionIds?: string[]
       sessionOutputPaths?: Record<string, string>
+      diagnosticTraceId?: string
+      diagnosticLogPath?: string
+      diagnosticSummaryPath?: string
+      latestDiagnosticLogPath?: string
+      latestDiagnosticSummaryPath?: string
       error?: string
     }>
     exportSession: (sessionId: string, outputPath: string, options: ExportOptions) => Promise<{
@@ -1153,6 +1158,7 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
+  diagnosticTraceId?: string
 }
 
 export interface NianbanExportUploadPayload {
@@ -1167,7 +1173,13 @@ export interface NianbanExportUploadPayload {
 export interface NianbanExportUploadResult {
   ok: boolean
   importedCount: number
+  textImportedCount: number
+  imageUploadedCount: number
+  voiceUploadedCount: number
+  imageImportedCount: number
+  voiceImportedCount: number
   skippedCount: number
+  failedCount: number
   dyadId: number
   talkerId: string
   jsonPath?: string
@@ -1230,5 +1242,3 @@ declare global {
 }
 
 export { }
-
-
